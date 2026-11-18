@@ -680,19 +680,36 @@ end
 
 ### Static GNEP solvers
 
+"""
+    NabetaniParametrizationSolver
+
+Explicit solution of the Nabetani pVI with ParametricDAQP. `solve!` returns all critical regions,
+which also contain non-equilibria; the GNEs are given by [`gne_regions`](@ref).
+"""
 struct NabetaniParametrizationSolver
-    gnep::StaticGNEP
+    gnep::Union{StaticGNEP,LeaderParametrizedGNEP}
     mpavi::mpAVI
     options::ParametricDAQP.Settings
     status::Ref{Symbol}
+    AS0::Union{Nothing,Vector{Int}}    # optional initial active set for ParametricDAQP
 end
 
-function CommonSolve.init(gnep::StaticGNEP, ::Type{NabetaniParametrizationSolver}; θub=nothing, θlb=nothing, verbose::Int64=1)
+function CommonSolve.init(gnep::StaticGNEP, ::Type{NabetaniParametrizationSolver}; θub=nothing, θlb=nothing, verbose::Int64=1, AS0=nothing)
 
-    options = ParametricDAQP.Settings(verbose=verbose)
+    options = ParametricDAQP.Settings(verbose=verbose, store_AS=true)
     mpavi = NabetaniParametrization(gnep, θub=θub, θlb=θlb)
 
-    return NabetaniParametrizationSolver(gnep, mpavi, options, Ref(:Initialized))
+    return NabetaniParametrizationSolver(gnep, mpavi, options, Ref(:Initialized), AS0)
+end
+
+function CommonSolve.init(lp::LeaderParametrizedGNEP, ::Type{NabetaniParametrizationSolver};
+    θub=nothing, θlb=nothing, γub::Vector{Float64}, γlb::Vector{Float64}, verbose::Int64=1, AS0=nothing,
+    time_limit::Union{Int64,Nothing}=nothing, region_limit::Union{Int64,Nothing}=nothing)
+
+    limits = (; (k => v for (k, v) in pairs((; time_limit, region_limit)) if !isnothing(v))...)
+    options = ParametricDAQP.Settings(; verbose=verbose, store_AS=true, limits...)
+    mpavi = NabetaniParametrization(lp; θub=θub, θlb=θlb, γub=γub, γlb=γlb)
+    return NabetaniParametrizationSolver(lp, mpavi, options, Ref(:Initialized), AS0)
 end
 
 function CommonSolve.solve!(solver::NabetaniParametrizationSolver)
@@ -713,11 +730,11 @@ function CommonSolve.solve!(solver::NabetaniParametrizationSolver)
          ub = mpAVI.ub,
          lb = mpAVI.lb)
 
-    (sol, info) = ParametricDAQP.mpsolve(raw, Θ; opts = solver.options)
-    
-    # Remove critical regions not associated to Nash equilibria
-    filter_gne_crs!(sol, solver.gnep)
-    solver.status[] = :Solved
+    (sol, info) = isnothing(solver.AS0) ? ParametricDAQP.mpsolve(raw, Θ; opts = solver.options) :
+                  ParametricDAQP.mpsolve(raw, Θ; opts = solver.options, AS0 = solver.AS0)
+
+    sol.status == :Solved || @warn "[NabetaniParametrizationSolver] ParametricDAQP status $(sol.status): partial map"
+    solver.status[] = sol.status
     return sol
 end
 
@@ -728,19 +745,27 @@ struct PWAConvexOptSolver
     optGNEP::OptimalGNEP
     status::Ref{Symbol}
     verbose::Int64
+    θub::Union{Vector{Float64},Nothing}
+    θlb::Union{Vector{Float64},Nothing}
+    verify::Bool
+    AS0::Union{Nothing,Vector{Int}}
 end
 
-function CommonSolve.init(optGNEP::OptimalGNEP, ::Type{PWAConvexOptSolver}; verbose::Int64=1)
-    return PWAConvexOptSolver(optGNEP, Ref(:Initialized), verbose)
+function CommonSolve.init(optGNEP::OptimalGNEP, ::Type{PWAConvexOptSolver}; θub=nothing, θlb=nothing, verbose::Int64=1, verify::Bool=false, AS0=nothing)
+    return PWAConvexOptSolver(optGNEP, Ref(:Initialized), verbose, θub, θlb, verify, AS0)
 end
 
 function CommonSolve.solve!(solver::PWAConvexOptSolver)
     GNEP = solver.optGNEP.GNEP
-    GNEPsol = CommonSolve.solve(GNEP, NabetaniParametrizationSolver; verbose=solver.verbose)
+    nab = CommonSolve.init(GNEP, NabetaniParametrizationSolver; θub=solver.θub, θlb=solver.θlb, verbose=solver.verbose, AS0=solver.AS0)
+    GNEPsol = CommonSolve.solve!(nab)
     sol = select_optimal_gne(
         GNEPsol,
+        GNEP,
+        nab.mpavi,
         solver.optGNEP.ϕ,
-        solver.optGNEP.is_quadratic)
-    solver.status[] = :Solved
-    return (x=sol.u_star, ϕ=sol.φ_star)
+        solver.optGNEP.is_quadratic;
+        verify=solver.verify)
+    solver.status[] = sol.status == :optimal ? :Solved : sol.status
+    return (x=sol.u_star, ϕ=sol.φ_star, θ=sol.θ_star, result=sol)
 end

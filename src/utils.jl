@@ -141,13 +141,13 @@ function DynLQGame2mpAVI(prob::DynLQGameTV) # time varying
 end
 
 @doc raw"""
-    StaticGNE2mpAVI(game::StaticGNEP)
+    NabetaniParametrization(game::StaticGNEP; θub=nothing, θlb=nothing)
  
 Assemble static GNE game into multi-parametric variational inequality (mpAVI).
  
 The Nabetani-Tseng-Fukushima reparametrization transforms shared constraints into parameter-dependent bounds:
-- Agent 1: ``A_{\text{sh},1} x_1 \leq \theta_1``
-- Agent i (i>1): ``A_{\text{sh},i} x_i \leq -\theta_{i-1} + b_{\text{sh}}``
+- Agent i (i<N): ``A_{\text{sh},i} x_i \leq \theta_i``
+- Agent N: ``A_{\text{sh},N} x_N \leq b_{\text{sh}} - \sum_{i<N} \theta_i``
  
 Returns: ``\text{VI}(H x + f, A x \leq B \theta + b)`` where ``\theta \in [\text{lb}, \text{ub}]``
 """
@@ -215,12 +215,19 @@ end
 ####### END Type conversion functions #######
 
 ####### Helper functions for optimal GNE selection ##########
+"""
+    filter_gne_crs!(sol, game)
+
+Deprecated: tests the Nabetani condition on `cr.AS`, which is only an independent active-set basis,
+so regions containing GNEs can be dropped. Use [`gne_regions`](@ref).
+"""
 function filter_gne_crs!(sol::ParametricDAQP.Solution, game::StaticGNEP)
+    Base.depwarn("filter_gne_crs! can drop GNE regions; use gne_regions.", :filter_gne_crs!)
     N = game.N
     m_sh = length(game.b_sh)
     n_local = sum(size(game.A_loc[i], 1) for i in 1:N)
     shared_start = n_local + 1
-    
+
     filter!(sol.CRs) do cr
         for i in 1:m_sh
             # Collect all rows of the reformulated constraints associated to the same shared constraints
@@ -239,74 +246,360 @@ function filter_gne_crs!(sol::ParametricDAQP.Solution, game::StaticGNEP)
     return length(sol.CRs)
 end
 
+@doc raw"""
+    equal_slack_map(game; Bγ=zeros(m, 0)) -> (L, Lγ, l)
+
+Equal-slack allocation (Nabetani et al. 2011, Thm. 3.5)
+``\beta_i = A_{\text{sh},i}x_i + \frac1N(b_{\text{sh}} + B_\gamma\gamma - \sum_j A_{\text{sh},j}x_j)``;
+returns its free part ``\theta = \beta_{1:N-1} = Lx + L_\gamma\gamma + l``.
+"""
+function equal_slack_map(game::StaticGNEP; Bγ::AbstractMatrix=zeros(length(game.b_sh), 0))
+    N, m = game.N, length(game.b_sh)
+    offs = cumsum([0; game.n])
+    Ā = hcat(game.A_sh...)
+    L = zeros((N - 1) * m, sum(game.n))
+    for i in 1:N-1
+        rows = (i-1)*m+1:i*m
+        L[rows, offs[i]+1:offs[i+1]] .= game.A_sh[i]
+        L[rows, :] .-= Ā ./ N
+    end
+    return L, repeat(Matrix{Float64}(Bγ) ./ N, N - 1), repeat(game.b_sh ./ N, N - 1)
+end
+
+"""
+    equal_slack_allocation(game, x; γ=Float64[], Bγ=zeros(m, 0)) -> θ
+
+Free part θ of the equal-slack allocation of `x` (see [`equal_slack_map`](@ref)).
+"""
+function equal_slack_allocation(game::StaticGNEP, x::AbstractVector;
+                                γ::AbstractVector=Float64[], Bγ::AbstractMatrix=zeros(length(game.b_sh), 0))
+    L, Lγ, l = equal_slack_map(game; Bγ=Bγ)
+    return L * x + (isempty(γ) ? zeros(length(l)) : Lγ * γ) + l
+end
+
+# Equal-slack equality θ = Λ(Kp + h, γ) of a region with law x = Kp + h, p = [θ; γ], as E p = e.
+function equal_slack_constraint(game::StaticGNEP, K::AbstractMatrix, h::AbstractVector;
+                                Bγ::AbstractMatrix=zeros(length(game.b_sh), 0))
+    L, Lγ, l = equal_slack_map(game; Bγ=Bγ)
+    nβ, nγ = size(L, 1), size(Lγ, 2)
+    return [I zeros(nβ, nγ)] - L * K - [zeros(nβ, nβ) Lγ], L * h + l
+end
+
+# Reduce E p = e to independent rows (numerical rank); (nothing, nothing) if inconsistent.
+function reduce_equality(E::AbstractMatrix, e::AbstractVector; tol::Float64=1e-9)
+    isempty(e) && return E, e
+    F = svd(E; full=true)
+    r = count(F.S .> tol * max(1.0, maximum(F.S; init=0.0)))
+    Ur = F.U[:, 1:r]
+    norm(e - Ur * (Ur' * e), Inf) > 1e3 * tol * max(1.0, norm(e, Inf)) && return nothing, nothing
+    return Diagonal(F.S[1:r]) * F.Vt[1:r, :], Ur' * e
+end
+
+@doc raw"""
+    gne_regions(sol, game, mpavi; Bγ=zeros(m, 0), include_inconsistent=false)
+
+For each critical region r: the law ``x = K_r p + h_r`` (from the KKT system of `cr.AS`) and
+``\mathcal E_r = \{p : A_{\text{in}} p \le b_{\text{in}},\ Ep = e\}`` (region, primal feasibility and
+box; equal-slack equality reduced to independent rows). ``K_r p + h_r`` is a GNE iff
+``p \in \mathcal E_r`` (Nabetani et al. 2011, Thms. 3.5–3.6). Soundness needs a valid law and convex
+players (symmetric ``Q_{ii} \succeq 0``); completeness also needs a unique pVI solution at the
+equal-slack allocation (e.g. ``H + H^\top \succ 0``), the allocation in the box and a complete map.
+The reduction uses a numerical rank decision, so ``\mathcal E_r`` is exact only up to that tolerance;
+`E0, e0` hold the unreduced equality. Regions with an inconsistent equality (`consistent = false`) are
+returned only if `include_inconsistent`.
+"""
+function gne_regions(sol::ParametricDAQP.Solution, game::StaticGNEP, mpavi::mpAVI;
+                     Bγ::AbstractMatrix=zeros(length(game.b_sh), 0), include_inconsistent::Bool=false)
+    n = size(mpavi.H, 1)
+    λmin = minimum(eigvals(Symmetric((mpavi.H + mpavi.H') / 2)))
+    λmin > 0 || @warn "[gne_regions] H + Hᵀ is not positive definite (λ_min = $λmin): completeness is not guaranteed"
+    regions = NamedTuple[]
+    for (k, cr) in enumerate(sol.CRs)
+        G = cr.Ath' * Diagonal(sol.scaling)
+        g = cr.bth + G * sol.translation
+        # cr.z is not used: ParametricDAQP v0.6.1 drops active constraints whose multiplier is constant in p
+        AS = Int.(collect(cr.AS))
+        Aa = mpavi.A[AS, :]
+        KKT = [mpavi.H Aa'; Aa zeros(length(AS), length(AS))]
+        K = (KKT \ [-mpavi.F; mpavi.B[AS, :]])[1:n, :]
+        h = (KKT \ [-mpavi.f; mpavi.b[AS]])[1:n]
+        nθ = size(K, 2)
+        Ain = [G; mpavi.A * K - mpavi.B; I(nθ); -I(nθ)]
+        bin = [g; mpavi.b - mpavi.A * h; mpavi.ub; -mpavi.lb]
+        E0, e0 = equal_slack_constraint(game, K, h; Bγ=Bγ)
+        E, e = reduce_equality(E0, e0)
+        consistent = !isnothing(E)
+        (consistent || include_inconsistent) || continue
+        consistent || ((E, e) = (zeros(0, nθ), Float64[]))
+        push!(regions, (K=K, h=h, G=G, g=g, Ain=Ain, bin=bin, E=E, e=e, E0=E0, e0=e0, AS=AS, region=k, consistent=consistent))
+    end
+    return regions
+end
+
+@doc raw"""
+    evaluate_gne(regions, p; tol=1e-8)
+
+``K_r p + h_r`` for the first region with ``p \in \mathcal E_r`` (up to `tol`), else `nothing`.
+"""
+function evaluate_gne(regions::AbstractVector, θ::AbstractVector; tol::Float64=1e-8)
+    for R in regions
+        R.consistent && regional_residual(θ, R, R.Ain, R.bin) <= tol && return R.K * θ + R.h
+    end
+    return nothing
+end
+
+"""
+    is_gne(game, x; tol=1e-7) -> (ok, gap, gaps, infeas)
+
+Independent GNE certificate: `x` is feasible and no player improves its cost by more than `tol`
+(relative) with a best response under the original constraints. Assumes symmetric `Q_ii`.
+"""
+function is_gne(game::StaticGNEP, x::AbstractVector; tol::Float64=1e-7)
+    N = game.N
+    offs = cumsum([0; game.n])
+    blk(i) = x[offs[i]+1:offs[i+1]]
+    Āx = sum(game.A_sh[j] * blk(j) for j in 1:N)
+    infeas = max(0.0, maximum(Āx - game.b_sh; init=-Inf),
+                 maximum((maximum(game.A_loc[i] * blk(i) - game.b_loc[i]; init=-Inf) for i in 1:N); init=-Inf))
+    gaps = zeros(N)
+    ok = infeas <= tol
+    for i in 1:N
+        Qii = game.Q[i][i]
+        c = game.q[i] + sum((game.Q[i][j] * blk(j) for j in 1:N if j != i); init=zeros(game.n[i]))
+        Ji(y) = 0.5 * y' * Qii * y + c' * y
+        model = Model(Clarabel.Optimizer)
+        set_silent(model)
+        for att in ("tol_gap_abs", "tol_gap_rel", "tol_feas")
+            set_attribute(model, att, 1e-10)
+        end
+        @variable(model, y[1:game.n[i]])
+        # right-hand sides relaxed to contain xᵢ, so a slightly infeasible x still gives a feasible problem
+        size(game.A_loc[i], 1) > 0 && @constraint(model, game.A_loc[i] * y .<= max.(game.b_loc[i], game.A_loc[i] * blk(i)))
+        @constraint(model, game.A_sh[i] * y .<= max.(game.b_sh - (Āx - game.A_sh[i] * blk(i)), game.A_sh[i] * blk(i)))
+        @objective(model, Min, Ji(y))
+        optimize!(model)
+        gaps[i] = is_solved_and_feasible(model; allow_almost=true) ? Ji(blk(i)) - Ji(value.(y)) : Inf
+        ok &= gaps[i] <= tol * max(1.0, abs(Ji(blk(i))))
+    end
+    return (ok=ok, gap=maximum(gaps), gaps=gaps, infeas=infeas)
+end
+
+"""
+    in_gne_map(regions, game, x; γ=Float64[], Bγ=zeros(m, 0), tol=1e-8) -> (found, region, θ)
+
+Completeness check for `x`: its equal-slack parameter lies in some ``\\mathcal E_r`` and maps back to `x`.
+"""
+function in_gne_map(regions::AbstractVector, game::StaticGNEP, x::AbstractVector;
+                    γ::AbstractVector=Float64[], Bγ::AbstractMatrix=zeros(length(game.b_sh), 0), tol::Float64=1e-8)
+    p = [equal_slack_allocation(game, x; γ=γ, Bγ=Bγ); γ]
+    for R in regions
+        R.consistent && regional_residual(p, R, R.Ain, R.bin) <= tol &&
+            norm(R.K * p + R.h - x, Inf) <= tol * max(1.0, norm(x, Inf)) && return (found=true, region=R.region, θ=p)
+    end
+    return (found=false, region=0, θ=p)
+end
+
+"""
+    check_gne_map(sol, game, mpavi; Bγ=zeros(m, 0), game_at=γ -> game, tol=1e-7) -> (ok, regions)
+
+Soundness check: certifies with [`is_gne`](@ref) the LP vertices ``\\min \\pm p_k`` of every
+``\\mathcal E_r`` and their mean.
+"""
+function check_gne_map(sol::ParametricDAQP.Solution, game::StaticGNEP, mpavi::mpAVI;
+                       Bγ::AbstractMatrix=zeros(length(game.b_sh), 0), game_at::Function=γ -> game,
+                       tol::Float64=1e-7)
+    nγ = size(Bγ, 2)
+    results = NamedTuple[]
+    for R in gne_regions(sol, game, mpavi; Bγ=Bγ)
+        nθ = size(R.K, 2)
+        pts = Vector{Vector{Float64}}()
+        for k in 1:nθ, sgn in (1.0, -1.0)
+            model = Model(Clarabel.Optimizer)
+            set_silent(model)
+            @variable(model, θ[1:nθ])
+            @constraint(model, R.Ain * θ .<= R.bin)
+            isempty(R.e) || @constraint(model, R.E * θ .== R.e)
+            @objective(model, Min, sgn * θ[k])
+            optimize!(model)
+            is_solved_and_feasible(model; allow_almost=true) && push!(pts, value.(θ))
+        end
+        isempty(pts) && continue
+        push!(pts, sum(pts) / length(pts))
+        certs = [is_gne(game_at(p[end-nγ+1:end]), R.K * p + R.h; tol=tol) for p in pts]
+        X = reduce(hcat, [R.K * p + R.h for p in pts])
+        push!(results, (region=R.region, npoints=length(pts), certified=count(c -> c.ok, certs),
+                        gap=maximum(c -> c.gap, certs), dim=rank(X .- X[:, 1]; atol=1e-7)))
+    end
+    return (ok=all(r -> r.certified == r.npoints, results), regions=results)
+end
+
+regional_residual(p, R, Ain, bin) = max(maximum(Ain * p - bin; init=0.0), isempty(R.e) ? 0.0 : norm(R.E * p - R.e, Inf))
+
+# Refine θ on the affine hull of the equality and the active rows of E_r (a row only if it raises the
+# rank: parallel active rows agree only up to round-off), exactly for quadratic ϕ (`P`, `q`), by
+# projection otherwise. Kept only if feasible to 1e-9 and not worse than θ by more than 1e-6 (relative).
+function polish_regional_solution(θ, R, ϕp, Ain, bin; P=nothing, q=nothing)
+    Aeq, beq = R.E, R.e
+    for k in findall(bin - Ain * θ .<= 1e-6)
+        A2 = [Aeq; Ain[k:k, :]]
+        rank(A2; rtol=1e-9) > size(Aeq, 1) && ((Aeq, beq) = (A2, [beq; bin[k]]))
+    end
+    θs = isempty(beq) ? θ : θ - pinv(Aeq) * (Aeq * θ - beq)
+    isnothing(P) || (Z = nullspace(Aeq); θs -= Z * (pinv(Z' * P * Z) * (Z' * (P * θs + q))))
+    ok = regional_residual(θs, R, Ain, bin) <= 1e-9 && ϕp(θs) <= ϕp(θ) + 1e-6 * max(1.0, abs(ϕp(θ)))
+    return ok ? θs : θ
+end
+
+# Hessian and gradient of a quadratic JuMP expression in the variables θ
+function quadratic_coefficients(obj, θ::AbstractVector)
+    idx = Dict(v => i for (i, v) in enumerate(θ))
+    P, p = zeros(length(θ), length(θ)), zeros(length(θ))
+    q = convert(QuadExpr, obj)
+    for (pair, c) in q.terms
+        i, j = idx[pair.a], idx[pair.b]
+        P[i, j] += c; P[j, i] += c
+    end
+    for (v, c) in q.aff.terms
+        p[idx[v]] += c
+    end
+    return P, p
+end
+
+function regional_status(model)
+    st = termination_status(model)
+    st in (OPTIMAL, LOCALLY_SOLVED) && primal_status(model) == FEASIBLE_POINT && return :solved
+    st in (ALMOST_OPTIMAL, ALMOST_LOCALLY_SOLVED) && return :inexact
+    st in (INFEASIBLE, LOCALLY_INFEASIBLE) && return :infeasible_reported
+    st == ALMOST_INFEASIBLE && return :inexact_infeasible
+    return :failed
+end
+
+# Emptiness of {Ain p ≤ bin, E p = e} by a separate Clarabel LP: :infeasible only with a certificate.
+function certify_empty(Ain, bin, E, e)
+    model = Model(Clarabel.Optimizer)
+    set_silent(model)
+    @variable(model, θ[1:size(Ain, 2)])
+    @constraint(model, Ain * θ .<= bin)
+    isempty(e) || @constraint(model, E * θ .== e)
+    optimize!(model)
+    st = termination_status(model)
+    st == INFEASIBLE && return :infeasible
+    st in (OPTIMAL, ALMOST_OPTIMAL) && return :nonempty
+    return :undecided
+end
+
+@doc raw"""
+    select_optimal_gne(sol, game, mpavi, ϕ, is_quadratic, optimizer=Clarabel.Optimizer;
+                       verify=false, assume_convex=false, Bγ=zeros(m, 0), Γ=nothing, game_at=γ -> game)
+
+Algorithm 1: minimize ϕ over every ``\mathcal E_r`` and return the best candidate (feasible to 1e-6).
+`status` is `:optimal` (over the GNEs represented in the box), `:unverified` or `:partial`.
+"""
 function select_optimal_gne(
     sol::ParametricDAQP.Solution,
+    game::StaticGNEP,
+    mpavi::mpAVI,
     ϕ::Function,
     is_quadratic::Bool,
-    optimizer = Clarabel.Optimizer
+    optimizer = Clarabel.Optimizer;
+    verify::Bool = false,
+    assume_convex::Bool = false,
+    Bγ::AbstractMatrix = zeros(length(game.b_sh), 0),
+    Γ = nothing,
+    game_at::Function = γ -> game,
+    leader_objective::Bool = false
 )::OptimalGNEResult
     if !is_quadratic && optimizer == Clarabel.Optimizer
-        @warn "[select_optimal_gne!] Non-quadratic problem with Clarabel not supported. Switching to IPOPT."
         optimizer = Ipopt.Optimizer
     end
+    nγ = size(Bγ, 2)
+    ϕxγ = leader_objective ? ϕ : (x, γ) -> ϕ(x)
     candidates = []
-    
-    for k in 1:length(sol.CRs)
-        CR_k = sol.CRs[k]
-        
-        # Extract region geometry
-        # Ath has shape n_θ × m_k; constraint is Ath'θ ≤ bth (see find_CR)
-        A_k = CR_k.Ath'  # m_k × n_θ
-        b_k = CR_k.bth
-        n_θ = size(A_k, 2)
-        
-        # Extract affine map: u = M_k θ + d_k from CR.z' * [θ; 1]
-        # CR.z is (n_θ+1) × n_u, so:
-        M_k = CR_k.z[1:end-1, :]'  # n_u × n_θ
-        d_k = vec(CR_k.z[end, :])   # n_u
-        n_u = size(M_k, 1)
-
-        # Construct optimization problem
+    region_status = Dict{Int,Symbol}()
+    region_convexity = Symbol[]
+    for R in gne_regions(sol, game, mpavi; Bγ=Bγ, include_inconsistent=true)
+        if !R.consistent
+            region_status[R.region] = :empty_inconsistent
+            continue
+        end
+        n_θ, n_u = size(R.K, 2), size(R.K, 1)
+        γof(p) = p[n_θ-nγ+1:n_θ]
+        ϕp(p) = ϕxγ(R.K * p + R.h, γof(p))
+        Ain, bin = R.Ain, R.bin
+        if !isnothing(Γ)
+            Ain = [Ain; zeros(size(Γ.A, 1), n_θ - nγ) Γ.A]
+            bin = [bin; Γ.b]
+        end
+        conv, backend, P, q = :unknown, optimizer, nothing, nothing
         if is_quadratic
-            # Quadratic problem: objective built by straightforward composition
-            model = Model(optimizer)
-            set_silent(model)
-            @variable(model, θ[1:n_θ])
-            @objective(model, Min, ϕ(M_k * θ .+ d_k))
-            @constraint(model, A_k * θ .<= b_k)
+            probe = Model()
+            @variable(probe, θp[1:n_θ])
+            P, q = quadratic_coefficients(ϕxγ(R.K * θp .+ R.h, θp[n_θ-nγ+1:n_θ]), θp)
+            Z = nullspace(R.E)
+            conv = (size(Z, 2) == 0 || minimum(eigvals(Symmetric(Z' * P * Z))) >= -1e-9) ? :verified : :nonconvex
+            # Clarabel needs P ⪰ 0 in the full space
+            backend == Clarabel.Optimizer && minimum(eigvals(Symmetric(P))) < -1e-9 && (backend = Ipopt.Optimizer)
+        end
+        model = Model(backend)
+        set_silent(model)
+        if backend == Clarabel.Optimizer
+            for att in ("tol_gap_abs", "tol_gap_rel", "tol_feas")
+                set_attribute(model, att, 1e-10)
+            end
+        end
+        @variable(model, θ[1:n_θ])
+        @constraint(model, Ain * θ .<= bin)
+        isempty(R.e) || @constraint(model, R.E * θ .== R.e)
+        if is_quadratic
+            @objective(model, Min, ϕxγ(R.K * θ .+ R.h, θ[n_θ-nγ+1:n_θ]))
         else
-            # Otherwise: add linear equality constraint
-            model = Model(optimizer)
-            set_silent(model)
-            @variable(model, θ[1:n_θ])
-            @variable(model, y[1:n_u])
-            @constraint(model, y .== M_k * θ .+ d_k)
-            @constraint(model, A_k * θ .<= b_k)
-            @operator(model, op_ϕ, m, (ys...) -> ϕ(collect(ys)))
+            @variable(model, y[1:n_u + nγ])
+            @constraint(model, y[1:n_u] .== R.K * θ .+ R.h)
+            @constraint(model, y[n_u+1:end] .== θ[n_θ-nγ+1:n_θ])
+            @operator(model, op_ϕ, n_u + nγ, (ys...) -> ϕxγ(collect(ys[1:n_u]), collect(ys[n_u+1:end])))
             @objective(model, Min, op_ϕ(y...))
         end
-        
         optimize!(model)
-        # Extract results only when optimal
-        if termination_status(model) == OPTIMAL
-            θ_opt = value.(θ)
-            obj_opt = objective_value(model)
-            push!(candidates, (θ=θ_opt, u=M_k * θ_opt + d_k, φ=obj_opt, region=k))
-        else
-            @warn "[select_optimal_gne!] Region $k skipped: termination status $(termination_status(model))"
+        st = regional_status(model)
+        if st == :infeasible_reported
+            st = certify_empty(Ain, bin, R.E, R.e) == :infeasible ? :infeasible : :infeasible_uncertified
         end
+        region_status[R.region] = st
+        st in (:solved, :inexact) || continue
+        θraw = value.(θ)
+        θ_opt = polish_regional_solution(θraw, R, ϕp, Ain, bin; P=P, q=q)
+        if !(regional_residual(θ_opt, R, Ain, bin) <= 1e-6)
+            region_status[R.region] = :infeasible_candidate
+            continue
+        end
+        regional_residual(θraw, R, Ain, bin) <= 1e-6 || (st = region_status[R.region] = :inexact)
+        push!(region_convexity, conv)
+        push!(candidates, (θ=θ_opt, u=R.K * θ_opt + R.h, γ=γof(θ_opt), φ=ϕp(θ_opt), region=R.region, status=st, convexity=conv,
+                           eq_residual=norm(R.E0 * θ_opt - R.e0, Inf)))
     end
-    
     if isempty(candidates)
-        error("[select_optimal_gne!] No regions solved successfully.")
+        all(in((:infeasible, :empty_inconsistent)), values(region_status)) &&
+            error("[select_optimal_gne] no GNE is represented: every certified set is empty (no equal-slack allocation of a GNE lies in the parameter box, intersected with Γ if given)")
+        error("[select_optimal_gne] no regional problem was solved; region statuses: $(region_status)")
     end
-    
-    # Global selection: pick best φ
-    φ_values = [c.φ for c in candidates]
-    k_best = argmin(φ_values)
-    best = candidates[k_best]
-    
-    return OptimalGNEResult(best.θ, best.u, best.φ, best.region, candidates)
+    best = candidates[argmin([c.φ for c in candidates])]
+    map_status = sol.status
+    convexity = any(==(:nonconvex), region_convexity) ? :nonconvex :
+                (is_quadratic && all(==(:verified), region_convexity)) ? :verified :
+                assume_convex ? :assumed : :unknown
+    numerically_clean = all(in((:solved, :infeasible, :empty_inconsistent)), values(region_status))
+    status = !(map_status == :Solved && numerically_clean) ? :partial :
+             convexity in (:verified, :assumed) ? :optimal : :unverified
+    nβ = length(best.θ) - nγ
+    box_boundary = any(k -> min(best.θ[k] - mpavi.lb[k], mpavi.ub[k] - best.θ[k]) <= 1e-7, 1:nβ)
+    box_boundary && @warn "[select_optimal_gne] selected allocation on the parameter-box boundary: enlarge θub/θlb to check for GNEs outside the box" best.θ[1:nβ]
+    best.eq_residual > 1e-6 && @warn "[select_optimal_gne] selected point violates the unreduced equal-slack equality by $(best.eq_residual)"
+    if verify && !is_gne(game_at(best.γ), best.u).ok
+        @warn "[select_optimal_gne] selected point failed the GNE certificate"
+        status == :optimal && (status = :unverified)
+    end
+    return OptimalGNEResult(best.θ, best.u, best.φ, best.region, candidates, best.γ, status, map_status,
+                            region_status, convexity, box_boundary)
 end
 
 ####### END Helper functions for optimal GNE selection ##########

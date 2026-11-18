@@ -518,6 +518,25 @@ struct StaticGNEP #
     end 
 end #
  
+"""
+    LeaderParametrizedGNEP(gnep, S, Bγ)
+
+GNEP family in a leader variable γ: player i's linear cost term is `q_i + S_i γ` and the shared
+constraints are `Σ_j A_sh,j x_j ≤ b_sh + Bγ γ` (`gnep` holds the data at γ = 0, `S = [S_1; …; S_N]`).
+"""
+struct LeaderParametrizedGNEP
+    gnep::StaticGNEP
+    S::Matrix{Float64}
+    Bγ::Matrix{Float64}
+    n_γ::Int
+
+    function LeaderParametrizedGNEP(gnep::StaticGNEP, S::AbstractMatrix, Bγ::AbstractMatrix)
+        n_γ = size(S, 2)
+        @assert size(S, 1) == sum(gnep.n) && size(Bγ) == (length(gnep.b_sh), n_γ) "S must be sum(n) × n_γ and Bγ m_sh × n_γ"
+        return new(gnep, Matrix{Float64}(S), Matrix{Float64}(Bγ), n_γ)
+    end
+end
+
 @doc raw"""
     mpAVI
 
@@ -728,13 +747,23 @@ struct OptimalGNEResult
     φ_star::Float64         #Performance metric value
     region_id::Int          #Which critical region contained optimum
     all_candidates::Vector  #All regional candidates for analysis
+    γ_star::Vector{Float64}
+    status::Symbol          #see select_optimal_gne
+    map_status::Symbol
+    region_status::Dict{Int,Symbol}
+    convexity::Symbol
+    box_boundary::Bool
 end
+OptimalGNEResult(θ, u, φ, r, c) = OptimalGNEResult(θ, u, φ, r, c, Float64[], :unknown, :unknown, Dict{Int,Symbol}(), :unknown, false)
 
 function Base.show(io::IO, result::OptimalGNEResult)
     println(io, "OptimalGNEResult")
     println(io, "  θ*: $(round.(result.θ_star; digits=6))")
     println(io, "  u*: $(round.(result.u_star; digits=6))")
     println(io, "  φ*: $(round(result.φ_star; digits=8))")
+    isempty(result.γ_star) || println(io, "  γ*: $(round.(result.γ_star; digits=6))")
     println(io, "  region: $(result.region_id)")
+    println(io, "  status: $(result.status) (map: $(result.map_status), convexity: $(result.convexity))")
+    result.box_boundary && println(io, "  warning: selected allocation on the parameter-box boundary")
     println(io, "  candidates: $(length(result.all_candidates))")
 end

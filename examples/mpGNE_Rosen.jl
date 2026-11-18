@@ -32,7 +32,9 @@ gnep = DyNECT.StaticGNEP(Q, q, A_loc, b_loc, A_sh, b_sh)
 θub = [5.0]
 θlb = [-5.0]
 
-sol = CommonSolve.solve(gnep, DyNECT.NabetaniParametrizationSolver; θub = θub, θlb = θlb)
+solver = CommonSolve.init(gnep, DyNECT.NabetaniParametrizationSolver; θub = θub, θlb = θlb)
+sol = CommonSolve.solve!(solver)
+regions = DyNECT.gne_regions(sol, gnep, solver.mpavi)
 
 # ============================================================================
 # Step 3: Check solution
@@ -46,13 +48,13 @@ test_interval = θlb[1]:0.1:θub[1]
 x_sol = []
 
 for θ in test_interval
-    x = DyNECT.evaluatePWA(sol, [θ])
+    x = DyNECT.evaluate_gne(regions, [θ])
     if !isnothing(x)
         push!(x_sol, x)
     end
 end
 
-all_test_ok = all(norm(xk[1] - (1 - xk[2])) < tol && xk[2] <= 0.5 && xk[2] >= -1 for xk in x_sol)
+all_test_ok = all(norm(xk[1] - (1 - xk[2])) < tol && xk[2] <= 0.5 + tol && xk[2] >= -1 - tol for xk in x_sol)
 
 if all_test_ok
     println("The parametric solution is correct.")
